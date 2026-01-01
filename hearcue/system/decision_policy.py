@@ -12,38 +12,32 @@ from hearcue.utils.constants import MODEL, POLICY
 
 # Per-class gates and temporal smoothing parameters
 CLASS_THRESHOLDS = {
-    "alarm": 0.80,
+    "dog": 0.60,
+    "car": 0.65,
+    "speech": 0.70,
     "ringtone": 0.75,
-    "dog": 0.70,
-    "car": 0.75,
-    "speech": 0.85,
-    "other": 0.90,
+    "alarm": 0.80,
+    "other": 0.0,
 }
 
-WINDOW = 8
+WINDOW = 5
 
 REQUIRED_HITS = {
-    "alarm": 5,
+    "dog": 3,
+    "car": 3,
+    "speech": 4,
     "ringtone": 4,
-    "dog": 4,
-    "car": 5,
-    "speech": 6,
+    "alarm": 4,
 }
 
-MIN_MARGIN = {
-    "alarm": 0.40,
-    "ringtone": 0.35,
-    "speech": 0.25,
-    "car": 0.25,
-    "dog": 0.20,
-}
+MIN_MARGIN_GLOBAL = 0.25
 
 
 @dataclass
 class DecisionPolicy:
     threshold: float = POLICY.confidence_threshold
     window: int = WINDOW
-    refractory_period: float = 3.0
+    refractory_period: float = 0.0
     class_thresholds: dict[str, float] = field(default_factory=lambda: CLASS_THRESHOLDS.copy())
     required_hits: dict[str, int] = field(default_factory=lambda: REQUIRED_HITS.copy())
     hist: Deque[Optional[str]] = field(init=False)
@@ -69,8 +63,7 @@ class DecisionPolicy:
         if top_conf < thr:
             top_label = None
         # Margin gate for tonal / prone classes
-        margin_req = MIN_MARGIN.get(top_label, 0.0) if top_label is not None else 0.0
-        if top_label is not None and margin < margin_req:
+        if top_label is not None and margin < MIN_MARGIN_GLOBAL:
             top_label = None
 
         self.hist.append(top_label)

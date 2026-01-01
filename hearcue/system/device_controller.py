@@ -1,4 +1,4 @@
-"""High-level orchestrator connecting audio, model, and actuators."""
+"""High-level orchestrator connecting audio, model, and actuators with debug-style UI."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -7,95 +7,72 @@ from typing import Iterable, Optional
 
 import numpy as np
 
-from hearcue.audio.logmelspec import log_mel_spectrogram
 from hearcue.audio.mic_stream import MicStream
-from hearcue.audio.ring_buffer import RingBuffer
 from hearcue.model.infer import TFLiteAudioClassifier
-from hearcue.system.decision_policy import DecisionPolicy
 from hearcue.system.haptic import HapticDriver
-from hearcue.system.led import LEDDriver
+from hearcue.system.symbolic_ui import SymbolicUI
+from hearcue.system.audio_frontend import AudioFrontend, DebugDecisionConfig
 from hearcue.utils.constants import AUDIO
 
 
 @dataclass
 class DeviceController:
     classifier: TFLiteAudioClassifier = field(default_factory=TFLiteAudioClassifier)
-    policy: DecisionPolicy = field(default_factory=DecisionPolicy)
     haptics: HapticDriver = field(default_factory=HapticDriver)
-    leds: LEDDriver = field(default_factory=LEDDriver)
+    ui: SymbolicUI = field(default_factory=SymbolicUI)
+    frontend_cfg: DebugDecisionConfig = field(default_factory=DebugDecisionConfig)
+    frontend: AudioFrontend = field(init=False)
 
-    # how many audio frames to include in the inference window
-    window_frames: int = 10
-
-    # per-window normalization (helps in real-time environments)
-    normalize_features: bool = True
-
-    ring_buffer: RingBuffer = field(init=False)
+    allowed_haptics: dict[str, set[str]] = field(
+        default_factory=lambda: {
+            "library": {"speech", "ringtone", "alarm"},
+            "outdoors": {"alarm", "car", "dog", "ringtone", "speech"},
+            "home": {"ringtone", "alarm", "speech"},
+        }
+    )
 
     def __post_init__(self) -> None:
-        window_size = AUDIO.frame_length * self.window_frames
-        # Make sure the ring buffer can always serve the requested window.
-        # Use 2x window for safety so reads keep working smoothly.
-        rb_size = max(AUDIO.ring_buffer_size, window_size * 2)
-        self.ring_buffer = RingBuffer(rb_size)
+        def predict_fn(spec: np.ndarray) -> np.ndarray:
+            return self.classifier.predict_proba(spec)
+
+        self.frontend = AudioFrontend(predict_fn=predict_fn, config=self.frontend_cfg)
 
     def process_chunk(self, chunk: np.ndarray) -> Optional[str]:
-        chunk = np.asarray(chunk, dtype=np.float32)
-        self.ring_buffer.write(chunk)
-
-        window_size = AUDIO.frame_length * self.window_frames
-        window = self.ring_buffer.read(window_size)
-        if window is None:
+        res = self.frontend.process_chunk(chunk)
+        if res is None:
+            return None
+        if "error" in res:
+            print(res["error"])
             return None
 
-        # Feature extraction (explicit params so it always matches constants)
-        features = log_mel_spectrogram(
-            window,
-            sample_rate=AUDIO.sample_rate,
-            frame_length=AUDIO.frame_length,
-            hop_length=AUDIO.hop_length,
-            n_mels=AUDIO.n_mels,
-            fmin=AUDIO.fmin,
-            fmax=AUDIO.fmax,
+        self.ui.show(
+            top_label=res["top_label"],
+            top_conf=res["top_conf"],
+            margin=res["margin"],
+            rms=res["rms"],
+            spec_min=res["spec_min"],
+            spec_max=res["spec_max"],
+            spec_std=res["spec_std"],
+            triggered=res["triggered"],
         )
 
-        # Optional per-window standardization for stable live outputs
-        if self.normalize_features:
-            mu = float(features.mean())
-            sigma = float(features.std())
-            features = (features - mu) / (sigma + 1e-6)
-
-        result = self.classifier.classify(features)
-        label, _conf = self.policy.should_alert(result.logits)
-
-        if label is None:
-            # Don’t spam clear if you don’t want flicker; but safe to clear.
-            self.leds.clear()
+        if res["triggered"] is None or res["triggered"] == "other":
             return None
 
-        # Actuate
-        pattern = self._pattern_for_label(label)
-        self.haptics.emit(pattern)
-
-        # Only set LED if this label exists in current LED color_map
-        # (prevents ValueError if LEDDriver isn’t updated for new labels)
-        if hasattr(self.leds, "color_map") and label in self.leds.color_map:
-            self.leds.set_state(label, mode="blink")
-        else:
-            self.leds.clear()
-
-        return label
+        allowed = self.allowed_haptics.get(self.ui.mode, set())
+        if res["triggered"] in allowed:
+            pattern = self._pattern_for_label(res["triggered"])
+            self.haptics.emit(pattern)
+        return res["triggered"]
 
     def _pattern_for_label(self, label: str) -> str:
-        # Your model labels: alarm, car, dog, explosion, knock, other, speech
         mapping = {
             "alarm": "modulated",
-            "explosion": "triple",
-            "knock": "triple",
             "dog": "short",
             "car": "medium",
             "speech": "short",
             "other": "short",
+            "ringtone": "short",
         }
         return mapping.get(label, "short")
 
