@@ -6,6 +6,7 @@ from typing import Iterable, List, Sequence, Tuple
 
 import numpy as np
 import soundfile as sf
+import random
 
 
 FloatArray = np.ndarray
@@ -73,3 +74,26 @@ def pairwise(iterable: Sequence[int]) -> Iterable[Tuple[int, int]]:
 def write_npz(path: str | Path, **arrays: FloatArray) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(path, **arrays)
+
+
+def spec_augment(
+    spec: np.ndarray,
+    num_mask: int = 2,
+    freq_masking_max_percentage: float = 0.15,
+    time_masking_max_percentage: float = 0.25,
+) -> np.ndarray:
+    """Mask blocks of frequency and time on a spectrogram for augmentation."""
+    spec = spec.copy()
+    num_freqs, num_frames = spec.shape
+
+    for _ in range(num_mask):
+        mask_len = random.randint(0, int(num_freqs * freq_masking_max_percentage))
+        f0 = random.randint(0, num_freqs - mask_len)
+        spec[f0 : f0 + mask_len, :] = spec.min()
+
+    for _ in range(num_mask):
+        mask_len = random.randint(0, int(num_frames * time_masking_max_percentage))
+        t0 = random.randint(0, num_frames - mask_len)
+        spec[:, t0 : t0 + mask_len] = spec.min()
+
+    return spec

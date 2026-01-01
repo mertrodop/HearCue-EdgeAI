@@ -14,22 +14,27 @@ class AudioConstants:
     fmax: int = 7600
     pre_emphasis: float = 0.97
     chunk_size: int = 1024
-    ring_buffer_size: int = 4096
+    ring_buffer_size: int = 16384
 
 
 @dataclass(frozen=True)
 class ModelConstants:
-    num_classes: int = 5
+    num_classes: int = 6
     class_labels: tuple[str, ...] = (
-        "doorbell",
-        "fire_alarm",
-        "knock",
         "speech",
-        "vacuum",
+        "car",
+        "dog",
+        "alarm",
+        "ringtone",
+        "other",
     )
-    model_path: str = "hearcue/model/hearcue_cnn.tflite"
+    # Use your freshly trained model by default (H5 for dev/eval)
+    model_path: str = "hearcue/model/hearcue_cnn.h5"
+
+    # Quant params only matter after you quantize to int8 tflite/hailo
     quant_scale: float = 0.05
     quant_zero_point: int = -2
+
 
 
 @dataclass(frozen=True)
