@@ -1,27 +1,56 @@
-"""Haptic driver simulation for vibration motor."""
-from __future__ import annotations
+import time
+import subprocess
+import signal
 
-from dataclasses import dataclass, field
-from typing import Dict, List
+class HapticController:
+    """
+    Single-pin haptic controller for GPIO27 using gpioset --mode=wait.
+    Guaranteed to work on Ubuntu Pi 5.
+    """
 
+    CHIP = "gpiochip4"
+    PIN = 27
 
-@dataclass
-class HapticDriver:
-    pattern_definitions: Dict[str, List[float]] = field(
-        default_factory=lambda: {
-            "short": [0.1],
-            "triple": [0.05, 0.05, 0.05],
-            "modulated": [0.1, 0.05, 0.2],
-            "medium": [0.2],
-        }
-    )
-    history: List[str] = field(default_factory=list)
+    def __init__(self):
+        self._proc = None
+        print("Haptics ready on GPIO27")
+        self.off()
 
-    def emit(self, pattern: str) -> None:
-        if pattern not in self.pattern_definitions:
-            raise ValueError(f"Unknown haptic pattern: {pattern}")
-        self.history.append(pattern)
-        # Real hardware API call would happen here.
+    def _force_low(self):
+        subprocess.run(
+            ["gpioset", self.CHIP, f"{self.PIN}=0"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
 
-    def last_pattern(self) -> str | None:
-        return self.history[-1] if self.history else None
+    def pulse(self, label: str = "", duration: float = 0.4):
+        # Stop anything currently running
+        self.off()
+
+        # Hold GPIO27 HIGH
+        self._proc = subprocess.Popen(
+            ["gpioset", "--mode=wait", self.CHIP, f"{self.PIN}=1"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        time.sleep(duration)
+
+        # Stop and release
+        self.off()
+
+    def off(self):
+        if self._proc is not None:
+            try:
+                self._proc.send_signal(signal.SIGINT)
+                self._proc.wait(timeout=0.3)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+            self._proc = None
+
+        # Always force LOW
+        self._force_low()

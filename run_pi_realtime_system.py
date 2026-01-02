@@ -21,16 +21,17 @@ TRAIN_STD = 5.043337821960449
 
 # ---------------- config ----------------
 MODEL_PATH = "hearcue/model/hearcue_cnn_best.keras"
-TFLITE_MODEL_PATH = "hearcue/model/hearcue_fp32.tflite"
+
+TFLITE_MODEL_PATH = "hearcue/model/hearcue_cnn_fp16.tflite"
+
 PRINT_HZ = 8.0
 
-MIC_DEVICE = 0
-MIC_SR = 48000
+TARGET_SR = 16000
 
 FRAMES_EXPECTED = 197
 WINDOW_SAMPLES = AUDIO.frame_length + AUDIO.hop_length * (FRAMES_EXPECTED - 1)
 
-RMS_SILENCE = 0.005
+RMS_SILENCE = 0.01
 
 MIN_MARGIN = 0.25
 CLASS_THRESHOLDS = {
@@ -49,15 +50,70 @@ REQUIRED_HITS = {
     "ringtone": 4,
     "alarm": 4,
 }
+COOLDOWN = {"car": 1.2, "alarm": 3.0, "ringtone": 2.0, "speech": 0.8, "dog": 2.0}
 # ---------------------------------------
 
 labels = list(MODEL.class_labels)
 history = []
+last_trigger: dict[str, float] = {}
 
 rb = RingBuffer(size=max(getattr(AUDIO, "ring_buffer_size", 8192), WINDOW_SAMPLES * 2))
 
+# --- event queue for main thread UI/haptics ---
+evt_q: "queue.Queue[dict]" = queue.Queue(maxsize=200)
+
+# --- audio queue (callback -> main thread) ---
+audio_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=50)
+
+
+def pick_jbl_device(prefer=("JBL", "Quantum", "Stream"), ban=("sysdefault", "default", "pipewire", "pulse")):
+    devs = sd.query_devices()
+    best = None
+    for i, d in enumerate(devs):
+        if d.get("max_input_channels", 0) <= 0:
+            continue
+        name = d.get("name", "")
+        lname = name.lower()
+
+        # skip virtual / routing devices
+        if any(b in lname for b in ban):
+            continue
+
+        score = sum(k.lower() in lname for k in prefer)
+
+        # strongly prefer hardware endpoints
+        if "(hw:" in lname:
+            score += 10
+
+        if best is None or score > best[0]:
+            best = (score, i, name, float(d.get("default_samplerate", 0.0)))
+
+    if best is None:
+        # fallback: allow any input device (still print list for debugging)
+        raise RuntimeError("Could not find a real hardware input device. Check sd.query_devices().")
+
+    print(f"Using input device: {best[1]} {best[2]} (native SR {best[3]})")
+    return best[1], int(best[3])
+
+
+def resample_linear(x: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+    """Simple linear resampler. Good enough for realtime classification."""
+    if src_sr == dst_sr:
+        return x.astype(np.float32, copy=False)
+    n = int(round(len(x) * dst_sr / src_sr))
+    if n <= 1:
+        return np.zeros((0,), dtype=np.float32)
+    xp = np.arange(len(x), dtype=np.float32)
+    xq = np.linspace(0, len(x) - 1, num=n, dtype=np.float32)
+    return np.interp(xq, xp, x).astype(np.float32)
+
+
+# Pick JBL + native SR (usually 44100)
+MIC_DEVICE, MIC_NATIVE_SR = pick_jbl_device()
+
 # --- model runtime ---
 probs_fn = None
+interpreter = None
 try:
     interpreter = tf.lite.Interpreter(model_path=TFLITE_MODEL_PATH)
     interpreter.allocate_tensors()
@@ -71,140 +127,28 @@ try:
 
     probs_fn = _tflite_predict
     print(f"Loaded TFLite model: {TFLITE_MODEL_PATH}")
-except (OSError, ValueError):
+except (OSError, ValueError) as e:
+    print(f"TFLite load failed ({e}); falling back to Keras: {MODEL_PATH}")
     model = tf.keras.models.load_model(MODEL_PATH)
     probs_fn = lambda x: model.predict(x, verbose=0)[0]
-    print(f"Loaded Keras model: {MODEL_PATH}")
-
-# --- event queue for main thread UI/haptics ---
-evt_q: "queue.Queue[dict]" = queue.Queue(maxsize=200)
-
-last_print = 0.0
-last_rms_debug = 0.0
-COOLDOWN = {"car": 1.2, "alarm": 3.0, "ringtone": 2.0, "speech": 0.8, "dog": 2.0}
-last_trigger: dict[str, float] = {}
 
 
-def callback(indata, frames, time_info, status):
-    global last_print, last_trigger, last_rms_debug
-
+def audio_callback(indata, frames, time_info, status):
+    # Keep callback minimal to avoid overflows
     if status:
-        print(status)
+        # printing too often can itself cause overflows; keep it minimal
+        # print(status)
+        pass
 
-    ch0_48k = indata[:, 0].astype(np.float32) / (2**31)
-    # If channel 0 is quiet on the device, try channel 1 instead.
-    # ch0_48k = indata[:, 1].astype(np.float32) / (2**31)
-    ch0_16k = ch0_48k[::3]
+    # JBL: typically int16 mono; but we set dtype explicitly below
+    ch = indata[:, 0].astype(np.float32) / 32768.0
+    ch16 = resample_linear(ch, MIC_NATIVE_SR, TARGET_SR)
 
-    now = time.time()
-    if now - last_rms_debug >= 0.5:
-        last_rms_debug = now
-        rms = float(np.sqrt(np.mean(ch0_16k * ch0_16k)))
-        print("RMS16k:", rms)
-
-    rb.write(ch0_16k)
-
-    wave = rb.read(WINDOW_SAMPLES)
-    if wave is None:
-        return
-
-    rms = float(np.sqrt(np.mean(wave * wave)))
-    if rms < RMS_SILENCE:
-        now = time.time()
-        if now - last_print >= (1.0 / PRINT_HZ):
-            last_print = now
-            ui_label = "idle"
-            try:
-                evt_q.put_nowait(
-                    {
-                        "top_label": ui_label,
-                        "top_conf": 1.0,
-                        "margin": 1.0,
-                        "rms": rms,
-                        "spec_min": None,
-                        "spec_max": None,
-                        "spec_std": None,
-                        "triggered": None,
-                    }
-                )
-            except queue.Full:
-                pass
-        return
-
-    wave = normalize_signal(wave.astype(np.float32))
-    spec = log_mel_spectrogram(
-        wave,
-        sample_rate=AUDIO.sample_rate,
-        frame_length=AUDIO.frame_length,
-        hop_length=AUDIO.hop_length,
-        n_mels=AUDIO.n_mels,
-        fmin=AUDIO.fmin,
-        fmax=AUDIO.fmax,
-    )
-    spec = (spec - TRAIN_MEAN) / (TRAIN_STD + 1e-6)
-
-    x = spec[np.newaxis, ..., np.newaxis].astype(np.float32)
-    if x.shape[1] != FRAMES_EXPECTED or x.shape[2] != AUDIO.n_mels:
-        print("BAD SHAPE:", x.shape)
-        return
-
-    probs = probs_fn(x)
-
-    sorted_idx = np.argsort(probs)
-    top_i = int(sorted_idx[-1])
-    top2_i = int(sorted_idx[-2]) if len(sorted_idx) > 1 else top_i
-    margin = float(probs[top_i] - probs[top2_i])
-    top_label = labels[top_i]
-    top_conf = float(probs[top_i])
-
-    # --- Apply margin and class thresholds (DEBUG POLICY) ---
-    if margin < MIN_MARGIN or top_conf < CLASS_THRESHOLDS.get(top_label, 0.0):
-        label = None
-    else:
-        label = top_label
-    if label == "other":
-        label = None
-
-    history.append(label)
-    if len(history) > SMOOTH_WINDOW:
-        history.pop(0)
-
-    triggered = None
-    if label is not None:
-        hits = sum(1 for l in history if l == label)
-        need = REQUIRED_HITS.get(label, SMOOTH_WINDOW)
-        if hits >= need:
-            triggered = label
-
-    now = time.time()
-    if now - last_print >= (1.0 / PRINT_HZ):
-        last_print = now
-        mn, mx, sdv = float(spec.min()), float(spec.max()), float(spec.std())
-        ui_label = "idle" if top_label == "other" else top_label
-        try:
-            evt_q.put_nowait(
-                {
-                    "top_label": ui_label,
-                    "top_conf": top_conf,
-                    "margin": margin,
-                    "rms": rms,
-                    "spec_min": mn,
-                    "spec_max": mx,
-                    "spec_std": sdv,
-                    "triggered": triggered,
-                }
-            )
-        except queue.Full:
-            pass
-
-    if triggered is not None and triggered != "other":
-        cd = COOLDOWN.get(triggered, 1.0)
-        if (now - last_trigger.get(triggered, 0.0)) >= cd:
-            last_trigger[triggered] = now
-            try:
-                evt_q.put_nowait({"haptic_trigger": triggered})
-            except queue.Full:
-                pass
+    try:
+        audio_q.put_nowait(ch16)
+    except queue.Full:
+        # drop newest chunk to keep realtime
+        pass
 
 
 def main():
@@ -220,6 +164,9 @@ def main():
         except Exception as e:
             print("Haptics: disabled:", e)
 
+    last_print = 0.0
+    last_rms_debug = 0.0
+
     last_ui = {
         "top_label": "other",
         "top_conf": 0.0,
@@ -231,21 +178,136 @@ def main():
         "triggered": None,
     }
 
+    # Use mic native SR to avoid PortAudio resample overhead
+    # Blocksize ~50ms at native SR
+    blocksize = int(MIC_NATIVE_SR * 0.05)
+
     with sd.InputStream(
         device=MIC_DEVICE,
-        channels=2,
-        samplerate=MIC_SR,
-        dtype="int32",
-        blocksize=AUDIO.chunk_size * 3,  # keeps the same time span as 16k chunks
-        callback=callback,
+        channels=1,
+        samplerate=MIC_NATIVE_SR,
+        dtype="int16",
+        blocksize=blocksize,
+        callback=audio_callback,
     ):
         while True:
+            # 1) Consume audio chunks (if any) and run inference (main thread)
+            processed_any = False
+            while True:
+                try:
+                    ch16 = audio_q.get_nowait()
+                except queue.Empty:
+                    break
+
+                processed_any = True
+                rb.write(ch16)
+
+            if processed_any:
+                wave = rb.read(WINDOW_SAMPLES)
+                if wave is not None:
+                    rms = float(np.sqrt(np.mean(wave * wave)))
+
+                    now = time.time()
+                    if now - last_rms_debug >= 0.5:
+                        last_rms_debug = now
+                        print("RMS16k:", rms)
+
+                    if rms < RMS_SILENCE:
+                        # show idle periodically
+                        if now - last_print >= (1.0 / PRINT_HZ):
+                            last_print = now
+                            evt = {
+                                "top_label": "idle",
+                                "top_conf": 1.0,
+                                "margin": 1.0,
+                                "rms": rms,
+                                "spec_min": None,
+                                "spec_max": None,
+                                "spec_std": None,
+                                "triggered": None,
+                            }
+                            try:
+                                evt_q.put_nowait(evt)
+                            except queue.Full:
+                                pass
+                    else:
+                        wave_n = normalize_signal(wave.astype(np.float32))
+                        spec = log_mel_spectrogram(
+                            wave_n,
+                            sample_rate=TARGET_SR,  
+                            frame_length=AUDIO.frame_length,
+                            hop_length=AUDIO.hop_length,
+                            n_mels=AUDIO.n_mels,
+                            fmin=AUDIO.fmin,
+                            fmax=AUDIO.fmax,
+                        )
+                        spec = (spec - TRAIN_MEAN) / (TRAIN_STD + 1e-6)
+
+                        x = spec[np.newaxis, ..., np.newaxis].astype(np.float32)
+                        if x.shape[1] == FRAMES_EXPECTED and x.shape[2] == AUDIO.n_mels:
+                            probs = probs_fn(x)
+
+                            sorted_idx = np.argsort(probs)
+                            top_i = int(sorted_idx[-1])
+                            top2_i = int(sorted_idx[-2]) if len(sorted_idx) > 1 else top_i
+                            margin = float(probs[top_i] - probs[top2_i])
+                            top_label = labels[top_i]
+                            top_conf = float(probs[top_i])
+
+                            # --- Apply margin and class thresholds ---
+                            if margin < MIN_MARGIN or top_conf < CLASS_THRESHOLDS.get(top_label, 0.0):
+                                label = None
+                            else:
+                                label = top_label
+                            if label == "other":
+                                label = None
+
+                            history.append(label)
+                            if len(history) > SMOOTH_WINDOW:
+                                history.pop(0)
+
+                            triggered = None
+                            if label is not None:
+                                hits = sum(1 for l in history if l == label)
+                                need = REQUIRED_HITS.get(label, SMOOTH_WINDOW)
+                                if hits >= need:
+                                    triggered = label
+
+                            now = time.time()
+                            if now - last_print >= (1.0 / PRINT_HZ):
+                                last_print = now
+                                mn, mx, sdv = float(spec.min()), float(spec.max()), float(spec.std())
+                                ui_label = "idle" if top_label == "other" else top_label
+                                evt = {
+                                    "top_label": ui_label,
+                                    "top_conf": top_conf,
+                                    "margin": margin,
+                                    "rms": rms,
+                                    "spec_min": mn,
+                                    "spec_max": mx,
+                                    "spec_std": sdv,
+                                    "triggered": triggered,
+                                }
+                                try:
+                                    evt_q.put_nowait(evt)
+                                except queue.Full:
+                                    pass
+
+                            if triggered is not None and triggered != "other":
+                                cd = COOLDOWN.get(triggered, 1.0)
+                                if (now - last_trigger.get(triggered, 0.0)) >= cd:
+                                    last_trigger[triggered] = now
+                                    try:
+                                        evt_q.put_nowait({"haptic_trigger": triggered})
+                                    except queue.Full:
+                                        pass
+
+            # 2) UI / haptics updates
             try:
                 evt = evt_q.get(timeout=0.05)
             except queue.Empty:
                 evt = None
 
-            # Idle redraw to keep UI responsive
             if evt is None:
                 ui.show(
                     top_label="idle" if last_ui["top_label"] == "other" else last_ui["top_label"],
@@ -260,27 +322,34 @@ def main():
                 time.sleep(0.005)
                 continue
 
-            if evt:
-                if "haptic_trigger" in evt:
-                    label = evt["haptic_trigger"]
-                    if haptic:
-                        haptic.pulse(label)
-                    ui.note_haptic(label)
-                else:
-                    last_ui = evt
-                    ui.show(
-                        top_label="idle" if evt["top_label"] == "other" else evt["top_label"],
-                        top_conf=evt["top_conf"],
-                        margin=evt["margin"],
-                        rms=evt["rms"],
-                        spec_min=evt["spec_min"],
-                        spec_max=evt["spec_max"],
-                        spec_std=evt["spec_std"],
-                        triggered=evt["triggered"],
-                    )
+            if "haptic_trigger" in evt:
+                label = evt["haptic_trigger"]
+                if haptic:
+                    haptic.pulse(label)
+                ui.note_haptic(label)
+            else:
+                last_ui = evt
+                ui.show(
+                    top_label="idle" if evt["top_label"] == "other" else evt["top_label"],
+                    top_conf=evt["top_conf"],
+                    margin=evt["margin"],
+                    rms=evt["rms"],
+                    spec_min=evt["spec_min"],
+                    spec_max=evt["spec_max"],
+                    spec_std=evt["spec_std"],
+                    triggered=evt["triggered"],
+                )
 
             time.sleep(0.005)
 
-
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        try:
+            from hearcue.system.haptic import HapticController
+            haptic = HapticController()
+            haptic.off()
+        except Exception:
+            pass
+
