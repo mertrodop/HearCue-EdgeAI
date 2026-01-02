@@ -48,14 +48,9 @@ Simulation Scenarios -> EventPlayer -> DeviceController Loop
 - `scripts`: entry points for training, simulation, and evaluation workflows.
 
 ## Testing
-Run the unit tests locally:
+Run the unit tests locally for pc and raspberry pi module separately:
 ```bash
-pytest
+python3 ./pc_ui.py
+python3 ./run_pi_realtime_system
 ```
-Tests cover the DSP pipeline, decision policy timing logic, and quantized inference integration.
-
-## Data Management
-Raw assets belong in `data/raw`, while curated training clips live in `data/processed/<label>`. The helper scripts automatically create any missing directories.
-
-## Notebooks
-Two notebooks illustrate model training (`training_notebook.ipynb`) and evaluation (`evaluation_notebook.ipynb`). Launch them via Jupyter Lab for interactive exploration.
+Tests cover the DSP pipeline, decision policy timing logic, and quantized inference integration. 
