@@ -24,10 +24,13 @@ MODEL_PATH = "hearcue/model/hearcue_cnn_best.keras"
 TFLITE_MODEL_PATH = "hearcue/model/hearcue_fp32.tflite"
 PRINT_HZ = 8.0
 
+MIC_DEVICE = 0
+MIC_SR = 48000
+
 FRAMES_EXPECTED = 197
 WINDOW_SAMPLES = AUDIO.frame_length + AUDIO.hop_length * (FRAMES_EXPECTED - 1)
 
-RMS_SILENCE = 0.03
+RMS_SILENCE = 0.005
 
 MIN_MARGIN = 0.25
 CLASS_THRESHOLDS = {
@@ -77,18 +80,29 @@ except (OSError, ValueError):
 evt_q: "queue.Queue[dict]" = queue.Queue(maxsize=200)
 
 last_print = 0.0
+last_rms_debug = 0.0
 COOLDOWN = {"car": 1.2, "alarm": 3.0, "ringtone": 2.0, "speech": 0.8, "dog": 2.0}
 last_trigger: dict[str, float] = {}
 
 
 def callback(indata, frames, time_info, status):
-    global last_print, last_trigger
+    global last_print, last_trigger, last_rms_debug
 
     if status:
         print(status)
 
-    chunk = indata[:, 0].astype(np.float32)
-    rb.write(chunk)
+    ch0_48k = indata[:, 0].astype(np.float32) / (2**31)
+    # If channel 0 is quiet on the device, try channel 1 instead.
+    # ch0_48k = indata[:, 1].astype(np.float32) / (2**31)
+    ch0_16k = ch0_48k[::3]
+
+    now = time.time()
+    if now - last_rms_debug >= 0.5:
+        last_rms_debug = now
+        rms = float(np.sqrt(np.mean(ch0_16k * ch0_16k)))
+        print("RMS16k:", rms)
+
+    rb.write(ch0_16k)
 
     wave = rb.read(WINDOW_SAMPLES)
     if wave is None:
@@ -218,10 +232,11 @@ def main():
     }
 
     with sd.InputStream(
-        channels=1,
-        samplerate=AUDIO.sample_rate,
-        blocksize=AUDIO.chunk_size,
-        dtype="float32",
+        device=MIC_DEVICE,
+        channels=2,
+        samplerate=MIC_SR,
+        dtype="int32",
+        blocksize=AUDIO.chunk_size * 3,  # keeps the same time span as 16k chunks
         callback=callback,
     ):
         while True:
