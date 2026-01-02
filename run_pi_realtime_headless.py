@@ -1,5 +1,8 @@
 import time
 import queue
+import json
+import socket
+import threading
 import numpy as np
 import sounddevice as sd
 import tensorflow as tf
@@ -13,6 +16,93 @@ try:
     from hearcue.system.haptic import HapticController
 except Exception:
     HapticController = None
+
+
+# =========================
+# UDP (Pi -> PC UI, PC -> Pi mode)
+# =========================
+PC_HOSTNAME = "Mertspc.local"  # <-- your PC mDNS name (from avahi: [Mertspc.local])
+PC_PORT = 5005                 # Pi -> PC
+PI_PORT = 5006                 # PC -> Pi
+
+def resolve_host(host: str) -> str:
+    try:
+        return socket.gethostbyname(host)
+    except Exception as e:
+        print("mDNS resolve failed:", host, e)
+        return host
+
+class PiUDP:
+    def __init__(self):
+        self.pc_ip = resolve_host(PC_HOSTNAME)
+
+        self.sock_tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        self.sock_rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock_rx.bind(("", PI_PORT))
+        self.sock_rx.settimeout(1.0)
+
+        self.mode = "home"
+        self._lock = threading.Lock()
+
+        threading.Thread(target=self._rx_loop, daemon=True).start()
+        threading.Thread(target=self._heartbeat_loop, daemon=True).start()
+
+    def _heartbeat_loop(self):
+        while True:
+            self.send({"type": "heartbeat", "ts": time.time()})
+            time.sleep(1.0)
+
+    def _rx_loop(self):
+        while True:
+            try:
+                data, _ = self.sock_rx.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except Exception:
+                continue
+
+            try:
+                msg = json.loads(data.decode("utf-8"))
+            except Exception:
+                continue
+
+            # PC sends: {"type":"mode","mode":"home"}
+            if msg.get("type") == "mode" and "mode" in msg:
+                with self._lock:
+                    self.mode = str(msg["mode"])
+                print(f"[MODE] -> {self.mode}")
+
+    def get_mode(self) -> str:
+        with self._lock:
+            return self.mode
+
+    def _refresh_pc_ip(self):
+        self.pc_ip = resolve_host(PC_HOSTNAME)
+
+    def send(self, msg: dict):
+        payload = json.dumps(msg).encode("utf-8")
+        try:
+            self.sock_tx.sendto(payload, (self.pc_ip, PC_PORT))
+        except Exception as e:
+            print("UDP send failed:", e)
+            self._refresh_pc_ip()
+            try:
+                self.sock_tx.sendto(payload, (self.pc_ip, PC_PORT))
+            except Exception as e2:
+                print("UDP send retry failed:", e2)
+
+    def send_idle(self):
+        self.send({"type": "status", "state": "idle", "ts": time.time()})
+
+    def send_trigger(self, label: str, conf: float | None = None):
+        msg = {"type": "event", "trigger": label, "ts": time.time()}
+        if conf is not None:
+            msg["conf"] = float(conf)
+        self.send(msg)
+
+udp = PiUDP()
+
 
 # Dataset-level normalization (from training stats)
 TRAIN_MEAN = -10.733114242553711
@@ -69,13 +159,11 @@ def pick_jbl_device(prefer=("JBL", "Quantum", "Stream"), ban=("sysdefault", "def
         name = d.get("name", "")
         lname = name.lower()
 
-        # skip virtual / routing devices
         if any(b in lname for b in ban):
             continue
 
         score = sum(k.lower() in lname for k in prefer)
 
-        # strongly prefer hardware endpoints
         if "(hw:" in lname:
             score += 10
 
@@ -90,7 +178,6 @@ def pick_jbl_device(prefer=("JBL", "Quantum", "Stream"), ban=("sysdefault", "def
 
 
 def resample_linear(x: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
-    """Simple linear resampler. Good enough for realtime classification."""
     if src_sr == dst_sr:
         return x.astype(np.float32, copy=False)
     n = int(round(len(x) * dst_sr / src_sr))
@@ -101,7 +188,6 @@ def resample_linear(x: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
     return np.interp(xq, xp, x).astype(np.float32)
 
 
-# Pick JBL + native SR (usually 44100)
 MIC_DEVICE, MIC_NATIVE_SR = pick_jbl_device()
 
 # --- model runtime ---
@@ -154,8 +240,8 @@ def main():
     last_print = 0.0
     last_rms_debug = 0.0
     last_status_print = 0.0
+    last_idle_udp = 0.0  # throttle idle packets
 
-    # Use mic native SR to avoid PortAudio resample overhead
     blocksize = int(MIC_NATIVE_SR * 0.05)
 
     with sd.InputStream(
@@ -182,12 +268,10 @@ def main():
                     rms = float(np.sqrt(np.mean(wave * wave)))
                     now = time.time()
 
-                    # debug RMS
                     if now - last_rms_debug >= 0.5:
                         last_rms_debug = now
                         print("RMS16k:", rms)
 
-                    # print idle/status occasionally (headless friendly)
                     if now - last_status_print >= 2.0:
                         last_status_print = now
                         if rms < RMS_SILENCE:
@@ -196,8 +280,10 @@ def main():
                             print("STATE: active")
 
                     if rms < RMS_SILENCE:
-                        # silence: do nothing
-                        pass
+                        # send idle to PC UI occasionally so it doesn't show stale trigger
+                        if now - last_idle_udp >= 1.0:
+                            last_idle_udp = now
+                            udp.send_idle()
                     else:
                         wave_n = normalize_signal(wave.astype(np.float32))
                         spec = log_mel_spectrogram(
@@ -222,7 +308,6 @@ def main():
                             top_label = labels[top_i]
                             top_conf = float(probs[top_i])
 
-                            # Apply margin and class thresholds
                             if margin < MIN_MARGIN or top_conf < CLASS_THRESHOLDS.get(top_label, 0.0):
                                 label = None
                             else:
@@ -241,7 +326,6 @@ def main():
                                 if hits >= need:
                                     triggered = label
 
-                            # print a lightweight status line at PRINT_HZ
                             if now - last_print >= (1.0 / PRINT_HZ):
                                 last_print = now
                                 ui_label = "idle" if top_label == "other" else top_label
@@ -250,11 +334,15 @@ def main():
                                     + (f" TRIGGER={triggered}" if triggered else "")
                                 )
 
-                            # haptics trigger (cooldown)
                             if triggered is not None:
                                 cd = COOLDOWN.get(triggered, 1.0)
                                 if (now - last_trigger.get(triggered, 0.0)) >= cd:
                                     last_trigger[triggered] = now
+
+                                    # notify PC UI
+                                    udp.send_trigger(triggered, top_conf)
+
+                                    # haptics
                                     if haptic:
                                         haptic.pulse(triggered)
 
